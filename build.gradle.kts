@@ -23,6 +23,14 @@ kotlin {
     macosArm64()
     macosX64()
 
+    // JS — ради IndexedDB в браузере. Контракты и пул от платформы не
+    // зависят; драйвер IndexedDB появится отдельным модулем позже.
+    // `nodejs()` нужен для запуска тестов в CI: браузерного раннера нет.
+    js(IR) {
+        browser()
+        nodejs()
+    }
+
     sourceSets {
         commonMain.dependencies {
             api(libs.kotlinx.coroutines.core)

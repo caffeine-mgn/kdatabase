@@ -1,0 +1,404 @@
+package pw.binom.db.pool
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import pw.binom.db.Connection
+import pw.binom.db.ConnectionLostException
+import pw.binom.db.SqlException
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Clock
+import kotlin.time.Instant
+
+/**
+ * Настройки пула.
+ *
+ * Значения по умолчанию — для OLTP средней руки. Провижинеру хватает
+ * `maxConnections = 4`: он не обслуживает поток запросов, ему нужна
+ * устойчивость к обрывам.
+ */
+data class PoolConfig(
+    /** Жёсткий потолок одновременных соединений. */
+    val maxConnections: Int = 8,
+    /** Сколько ждать свободное соединение, прежде чем бросить. */
+    val acquireTimeout: Duration = 15.seconds,
+    /** Простой дольше этого — соединение закрывается при уборке. */
+    val idleTimeout: Duration = 5.minutes,
+    /** Соединение живёт не дольше этого, даже если активно: смена пароля, DNS. */
+    val maxLifetime: Duration = 30.minutes,
+    /** Через сколько простаивающее соединение проверяется запросом. */
+    val pingInterval: Duration = 1.minutes,
+    /**
+     * Чем проверять живость.
+     *
+     * `SELECT 1` работает и в Postgres, и в SQLite. `null` — не проверять
+     * вовсе; нужно фейковому драйверу в тестах `korm`.
+     */
+    val pingQuery: String? = "SELECT 1",
+    /**
+     * Источник времени.
+     *
+     * Инжектируется, а не берётся напрямую из `Clock.System`, по двум
+     * причинам:
+     *
+     * * тесты уборки по простою и по времени жизни должны управлять
+     *   временем. `runTest` подменяет только задержки, а `Clock.System.now()`
+     *   остаётся реальным — проверка таймаутов на нём невозможна;
+     * * в продакшене может понадобиться монотонное время вместо системного,
+     *   чтобы перевод часов не закрывал соединения пачкой.
+     *
+     * По умолчанию — системные часы.
+     */
+    val clock: () -> Instant = { Clock.System.now() },
+) {
+    init {
+        require(maxConnections >= 1) { "maxConnections должен быть >= 1, получено $maxConnections" }
+        require(acquireTimeout.isPositive()) { "acquireTimeout должен быть > 0" }
+    }
+}
+
+/**
+ * Пул соединений поверх любого драйвера.
+ *
+ * ## Как ограничивается число соединений
+ *
+ * Открыть новое можно, только если `idle` пуст **и**
+ * `idle + inUse + creating < maxConnections`. Иначе вызывающий встаёт в
+ * очередь. Превысить потолок нельзя даже при ошибке в вызывающем коде.
+ *
+ * ## Почему состояние под одним `Mutex`
+ *
+ * `idle`, `inUse` и `creating` меняются согласованно. Атомарные счётчики
+ * (которых в `commonMain` и нет) дали бы окно, где `idle` уже пуст, а
+ * `creating` ещё не увеличен — и два клиента открыли бы лишние соединения.
+ *
+ * ## Синхронный `close()` против `suspend`-мьютекса
+ *
+ * `Connection.close()` синхронный (`AutoCloseable`), а мьютекс требует
+ * `suspend`. Разрыв закрыт так:
+ *
+ * * `close()` кладёт соединение в неограниченный [Channel] через `trySend`
+ *   (не блокирует, потокобезопасно, есть в native) и будит ожидающего;
+ * * фактический возврат в `idle` делает [drainLocked] — он вызывается из
+ *   `suspend`-путей ([acquire], [cleanUp], [withConnection]) и **дополнительно
+ *   из счётчиков** через `Mutex.tryLock()`: если мьютекс свободен прямо
+ *   сейчас, состояние приводится в порядок немедленно. `tryLock` не
+ *   `suspend`, поэтому доступен из геттеров.
+ *
+ * Почему последнее важно: вызывающий, закрывший соединение вручную и
+ * посмотревший `idleCount`, должен увидеть `1`, а не `0`. Иначе утечку не
+ * отличить от нормального возврата.
+ *
+ * ## Об отмене корутин
+ *
+ * Отмена посреди запроса оставляет протокол в неизвестном состоянии:
+ * недочитанный ответ будет прочитан следующим клиентом как его собственный.
+ * Поэтому `CancellationException` помечает соединение битым — оно
+ * уничтожается, а не возвращается в набор.
+ */
+class ConnectionPoolImpl(
+    private val config: PoolConfig,
+    private val factory: suspend () -> Connection,
+) : ConnectionPool {
+
+    private val mutex = Mutex()
+
+    internal class Entry(
+        val connection: Connection,
+        val createdAt: Instant,
+        var lastUsedAt: Instant,
+        var lastPingAt: Instant,
+    )
+
+    /** Что ожидающий должен сделать, проснувшись. */
+    internal sealed interface Handoff {
+        class Take(val connection: PooledConnection) : Handoff
+        /** Слот свободен — открывай сам. */
+        data object Create : Handoff
+    }
+
+    private class Returned(val pooled: PooledConnection)
+
+    private val idle = ArrayDeque<Entry>()
+    private val inUse = mutableSetOf<PooledConnection>()
+    private val waiters = ArrayDeque<CompletableDeferred<Handoff>>()
+
+    private var creating = 0
+    private var closed = false
+    private var _totalCreated = 0L
+    private var _timeouts = 0L
+
+    private val returns = Channel<Returned>(Channel.UNLIMITED)
+
+    override val maxConnections: Int get() = config.maxConnections
+
+    override val connectionCount: Int
+        get() {
+            drainNow()
+            return idle.size + inUse.size + creating
+        }
+
+    override val idleCount: Int
+        get() {
+            drainNow()
+            return idle.size
+        }
+
+    override val waitingCount: Int get() = waiters.size
+    override val totalCreated: Long get() = _totalCreated
+    override val timeouts: Long get() = _timeouts
+
+    /** Текущий момент по инжектированным часам. */
+    private fun now(): Instant = config.clock()
+
+    // ---------------------------------------------------------------- возврат
+
+    /**
+     * Разбор возвратов без `suspend`.
+     *
+     * `Mutex.tryLock()` доступен из обычных функций. Если мьютекс занят —
+     * уборку сделает тот, кто его держит, либо следующий `suspend`-вход.
+     * Для наблюдения состояния этого достаточно: конкуренция здесь короткая
+     * и наблюдение всегда может повториться.
+     */
+    private fun drainNow() {
+        if (returns.isEmpty) return
+        if (!mutex.tryLock()) return
+        try {
+            drainLocked()
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    private suspend fun drainSuspend() = mutex.withLock { drainLocked() }
+
+    private fun drainLocked() {
+        while (true) {
+            val r = returns.tryReceive().getOrNull() ?: break
+            processReturnLocked(r.pooled)
+        }
+    }
+
+    private fun onPooledClosed(pooled: PooledConnection) {
+        returns.trySend(Returned(pooled))
+        // Будим ожидающего: он проснётся, вызовет acquire, а тот разберёт
+        // возврат под мьютексом. Без пробуждения он проспал бы до таймаута.
+        waiters.forEach { it.complete(Handoff.Create) }
+        waiters.clear()
+    }
+
+    // ---------------------------------------------------------------- acquire
+
+    override suspend fun acquire(): PooledConnection {
+        drainSuspend()
+        val deadline = now() + config.acquireTimeout
+
+        while (true) {
+            var create = false
+            val waiter = CompletableDeferred<Handoff>()
+
+            mutex.withLock {
+                check(!closed) { "пул закрыт" }
+                takeIdleLocked()?.let { return it }
+
+                if (connectionCount < config.maxConnections) {
+                    creating++
+                    create = true
+                } else {
+                    waiters.addLast(waiter)
+                }
+            }
+
+            if (create) {
+                try {
+                    return createAndWrap()
+                } catch (e: Throwable) {
+                    mutex.withLock {
+                        creating--
+                        handoffLocked()
+                    }
+                    throw e
+                }
+            }
+
+            val remaining = deadline - now()
+            if (remaining <= Duration.ZERO) {
+                mutex.withLock {
+                    if (waiters.remove(waiter)) _timeouts++
+                }
+                throw timeoutError()
+            }
+
+            val handoff = withTimeoutOrNull(remaining) { waiter.await() }
+
+            if (handoff == null) {
+                val raced = mutex.withLock {
+                    if (waiters.remove(waiter)) {
+                        _timeouts++
+                        null
+                    } else {
+                        waiter.getCompleted()
+                    }
+                }
+                if (raced is Handoff.Take) return raced.connection
+                throw timeoutError()
+            }
+
+            when (handoff) {
+                is Handoff.Take -> return handoff.connection
+                Handoff.Create -> {
+                    drainSuspend()
+                    continue
+                }
+            }
+        }
+    }
+
+    /** Забирает соединение из `idle`, попутно закрывая просроченные. */
+    private fun takeIdleLocked(): PooledConnection? {
+        while (idle.isNotEmpty()) {
+            val e = idle.removeLast()
+            if ((now() - e.createdAt) > config.maxLifetime || (now() - e.lastUsedAt) > config.idleTimeout) {
+                runCatching { e.connection.close() }
+                continue
+            }
+            return wrapLocked(e)
+        }
+        return null
+    }
+
+    private fun wrapLocked(e: Entry): PooledConnection {
+        val pooled = PooledConnection(e.connection, e, ::onPooledClosed)
+        inUse.add(pooled)
+        return pooled
+    }
+
+    private suspend fun createAndWrap(): PooledConnection {
+        val conn = factory()
+        return mutex.withLock {
+            creating--
+            _totalCreated++
+            val now = now()
+            wrapLocked(Entry(conn, now, now, now)).also { handoffLocked() }
+        }
+    }
+
+    /** Обрабатывает возврат. Вызывается только под мьютексом. */
+    private fun processReturnLocked(pooled: PooledConnection) {
+        if (!inUse.remove(pooled)) return // уже разобран
+        val e = pooled.entryForPool
+
+        val reusable = !pooled.isBrokenForPool &&
+            !pooled.isClosed &&
+            runCatching { e.connection.isReadyForQuery }.getOrDefault(false)
+
+        if (!reusable) {
+            runCatching { e.connection.close() }
+            handoffLocked()
+            return
+        }
+
+        e.lastUsedAt = now()
+        idle.addLast(e)
+        handoffLocked()
+    }
+
+    /**
+     * Раздаёт освободившиеся слоты ожидающим.
+     *
+     * Сначала отдать готовое из `idle`, потом разрешить открыть новое:
+     * ожидающий, получивший [Handoff.Create], на следующем витке сам
+     * увеличит `creating` под мьютексом.
+     */
+    private fun handoffLocked() {
+        while (waiters.isNotEmpty()) {
+            val w = waiters.removeFirst()
+            val fromIdle = takeIdleLocked()
+            if (fromIdle != null) {
+                w.complete(Handoff.Take(fromIdle))
+                continue
+            }
+            if (connectionCount < config.maxConnections) {
+                w.complete(Handoff.Create)
+                continue
+            }
+            waiters.addFirst(w)
+            return
+        }
+    }
+
+    // ------------------------------------------------------------ withConnection
+
+    override suspend fun <T> withConnection(block: suspend (PooledConnection) -> T): T {
+        drainSuspend()
+        val c = acquire()
+        try {
+            return block(c)
+        } catch (e: Throwable) {
+            if (e is ConnectionLostException || e is CancellationException) {
+                c.markBroken()
+            }
+            throw e
+        } finally {
+            c.close()
+            drainSuspend()
+        }
+    }
+
+    // ---------------------------------------------------------------- cleanUp
+
+    override suspend fun cleanUp(): Int {
+        drainSuspend()
+        return mutex.withLock {
+            var closedCount = 0
+            val keep = ArrayDeque<Entry>()
+            val ping = config.pingQuery
+
+            for (e in idle) {
+                if ((now() - e.createdAt) > config.maxLifetime || (now() - e.lastUsedAt) > config.idleTimeout) {
+                    runCatching { e.connection.close() }
+                    closedCount++
+                    continue
+                }
+
+                if (ping != null && (now() - e.lastPingAt) > config.pingInterval) {
+                    val alive = runCatching { e.connection.executeUpdate(ping) }.isSuccess
+                    if (!alive) {
+                        runCatching { e.connection.close() }
+                        closedCount++
+                        continue
+                    }
+                    e.lastPingAt = now()
+                }
+
+                keep.addLast(e)
+            }
+
+            idle.clear()
+            idle.addAll(keep)
+            handoffLocked()
+            closedCount
+        }
+    }
+
+    // ------------------------------------------------------------------ close
+
+    override fun close() {
+        closed = true
+        returns.close()
+        while (idle.isNotEmpty()) {
+            runCatching { idle.removeFirst().connection.close() }
+        }
+    }
+
+    private fun timeoutError() = SqlException(
+        "не дождались свободного соединения за ${config.acquireTimeout}: " +
+            "открыто ${connectionCount}, занято ${inUse.size}, ждут ${waiters.size}",
+    )
+}

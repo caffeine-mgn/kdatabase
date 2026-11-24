@@ -50,6 +50,10 @@ kpostgres-pool    kpostgres-orm
 **Время инжектируется.** `PoolConfig.clock` — чтобы тесты управляли уборкой
 по простою. `runTest` подменяет `delay`, но не `Clock.System.now()`.
 
+**Без экспериментальных API.** `Channel.isEmpty` и
+`CompletableDeferred.getCompleted` требуют opt-in — заменены на `tryReceive`
+в цикле и явное поле результата. Предупреждений при сборке нет.
+
 ## Использование
 
 ```kotlin
@@ -69,4 +73,5 @@ pool.withConnection { conn ->
 
 ## Тесты
 
-`./gradlew :jvmTest` — 12 тестов пула на фейковом драйвере, БД не нужна.
+`./gradlew :jvmTest :linuxX64Test` — 12 тестов пула на обеих платформах,
+живая БД не нужна: пул работает с контрактом `Connection`.

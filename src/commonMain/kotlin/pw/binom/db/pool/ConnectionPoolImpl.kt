@@ -115,8 +115,20 @@ class ConnectionPoolImpl(
         var lastPingAt: Instant,
     )
 
-    /** Что ожидающий должен сделать, проснувшись. */
-    internal sealed interface Handoff {
+    /**
+     * Результат ожидания слота.
+     *
+     * `completed` нужен вместо экспериментального `CompletableDeferred.getCompleted`:
+     * при гонке таймаута и выдачи надо понять, успели ли выдать соединение
+     * ровно в этот момент. Без этого соединение потерялось бы навсегда.
+     */
+    private class Waiter {
+        val deferred = CompletableDeferred<Handoff>()
+        var result: Handoff? = null
+        var timedOut = false
+    }
+
+    private sealed interface Handoff {
         class Take(val connection: PooledConnection) : Handoff
         /** Слот свободен — открывай сам. */
         data object Create : Handoff
@@ -126,7 +138,7 @@ class ConnectionPoolImpl(
 
     private val idle = ArrayDeque<Entry>()
     private val inUse = mutableSetOf<PooledConnection>()
-    private val waiters = ArrayDeque<CompletableDeferred<Handoff>>()
+    private val waiters = ArrayDeque<Waiter>()
 
     private var creating = 0
     private var closed = false
@@ -167,7 +179,8 @@ class ConnectionPoolImpl(
      * и наблюдение всегда может повториться.
      */
     private fun drainNow() {
-        if (returns.isEmpty) return
+        // `Channel.isEmpty` экспериментален; `tryReceive` в цикле решает ту же
+        // задачу и не требует opt-in.
         if (!mutex.tryLock()) return
         try {
             drainLocked()
@@ -189,7 +202,10 @@ class ConnectionPoolImpl(
         returns.trySend(Returned(pooled))
         // Будим ожидающего: он проснётся, вызовет acquire, а тот разберёт
         // возврат под мьютексом. Без пробуждения он проспал бы до таймаута.
-        waiters.forEach { it.complete(Handoff.Create) }
+        waiters.forEach {
+            it.result = Handoff.Create
+            it.deferred.complete(Handoff.Create)
+        }
         waiters.clear()
     }
 
@@ -201,7 +217,7 @@ class ConnectionPoolImpl(
 
         while (true) {
             var create = false
-            val waiter = CompletableDeferred<Handoff>()
+            val waiter = Waiter()
 
             mutex.withLock {
                 check(!closed) { "пул закрыт" }
@@ -235,15 +251,20 @@ class ConnectionPoolImpl(
                 throw timeoutError()
             }
 
-            val handoff = withTimeoutOrNull(remaining) { waiter.await() }
+            val handoff = withTimeoutOrNull(remaining) {
+                waiter.deferred.await().also { waiter.result = it }
+            }
 
             if (handoff == null) {
+                // Гонка: соединение могли выдать ровно в момент таймаута.
+                // Если оно в очереди — снимаем и считаем таймаут; если уже
+                // выдано — забираем, иначе потерялось бы навсегда.
                 val raced = mutex.withLock {
                     if (waiters.remove(waiter)) {
                         _timeouts++
                         null
                     } else {
-                        waiter.getCompleted()
+                        waiter.result
                     }
                 }
                 if (raced is Handoff.Take) return raced.connection
@@ -321,11 +342,14 @@ class ConnectionPoolImpl(
             val w = waiters.removeFirst()
             val fromIdle = takeIdleLocked()
             if (fromIdle != null) {
-                w.complete(Handoff.Take(fromIdle))
+                val h = Handoff.Take(fromIdle)
+                w.result = h
+                w.deferred.complete(h)
                 continue
             }
             if (connectionCount < config.maxConnections) {
-                w.complete(Handoff.Create)
+                w.result = Handoff.Create
+                w.deferred.complete(Handoff.Create)
                 continue
             }
             waiters.addFirst(w)

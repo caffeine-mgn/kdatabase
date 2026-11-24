@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
+    `maven-publish`
 }
 
 group = "pw.binom.db"
@@ -23,6 +24,13 @@ kotlin {
     macosArm64()
     macosX64()
 
+    // Apple mobile: kpostgres публикуется под iOS, и без этих таргетов
+    // зависимость от kdatabase не резолвится в appleMain. mingw — по той же
+    // причине: kpostgres собран и под Windows.
+    iosArm64()
+    iosSimulatorArm64()
+    mingwX64()
+
     // JS — ради IndexedDB в браузере. Контракты и пул от платформы не
     // зависят; драйвер IndexedDB появится отдельным модулем позже.
     // `nodejs()` нужен для запуска тестов в CI: браузерного раннера нет.
@@ -39,6 +47,14 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
+    }
+}
+
+publishing {
+    repositories {
+        // Локальная публикация для соседних репозиториев (kpostgres, ksqlite,
+        // korm): они собираются против свежей версии без похода в Central.
+        mavenLocal()
     }
 }
 

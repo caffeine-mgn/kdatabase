@@ -166,7 +166,7 @@ private class FakeResultSet(
         else -> ColumnType.OTHER
     }
 
-    override fun next(): Boolean {
+    override suspend fun next(): Boolean {
         row++
         return row < rows.size
     }

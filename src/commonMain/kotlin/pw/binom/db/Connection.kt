@@ -28,6 +28,21 @@ interface Connection : AutoCloseable {
 
     val transactionMode: TransactionMode
 
+    /**
+     * Открыта ли транзакция прямо сейчас.
+     *
+     * Нужен там, где транзакция — не удобство, а условие корректности.
+     * Блокирующее чтение (`FOR UPDATE`) вне транзакции бессмысленно: в
+     * Postgres блокировка снимется на первом же `COMMIT`, которого не будет,
+     * а точнее — снимется сразу после оператора, потому что неявная
+     * транзакция кончилась.
+     *
+     * Отдельно от [transactionMode], потому что уровень изоляции и факт
+     * открытой транзакции — разные вещи: `READ_COMMITTED` бывает и внутри
+     * транзакции, и вне её.
+     */
+    val isInTransaction: Boolean get() = false
+
     suspend fun setTransactionMode(mode: TransactionMode)
 
     suspend fun beginTransaction()

@@ -17,4 +17,33 @@ interface DatabaseInfo {
     val engine: DatabaseEngine
     val tableNameQuotesStart: String
     val tableNameQuotesEnd: String
+
+    /**
+     * Как эта СУБД блокирует строку от параллельной записи.
+     *
+     * ORM берёт стратегию отсюда и строит SQL по ней. Так один и тот же
+     * `findById(lock = true)` работает и в Postgres (`FOR UPDATE`), и в
+     * SQLite (`BEGIN IMMEDIATE` без суффикса).
+     *
+     * По умолчанию [LockStrategy.NONE]: драйвер, не заявивший обратного,
+     * блокировку не обеспечивает, и ORM должна на этом падать, а не делать
+     * вид, что заблокировала.
+     */
+    val lockStrategy: LockStrategy get() = LockStrategy.NONE
+
+    /**
+     * Диалект: фрагменты SQL, зависящие от СУБД.
+     *
+     * Собирается из [lockStrategy] по умолчанию, чтобы драйверу не писать
+     * его вручную.
+     */
+    val dialect: SqlDialect
+        get() = object : SqlDialect {
+            override fun forUpdateClause(): String = when (lockStrategy) {
+                LockStrategy.ROW_LOCK -> "FOR UPDATE"
+                LockStrategy.TRANSACTION_LOCK, LockStrategy.NONE -> ""
+            }
+
+            override val lockStrategy: LockStrategy get() = this@DatabaseInfo.lockStrategy
+        }
 }

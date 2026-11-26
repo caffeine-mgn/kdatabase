@@ -100,11 +100,35 @@ data class PoolConfig(
  * недочитанный ответ будет прочитан следующим клиентом как его собственный.
  * Поэтому `CancellationException` помечает соединение битым — оно
  * уничтожается, а не возвращается в набор.
+ *
+ * ## Чем пул отличается от драйверного
+ *
+ * Здесь нет ни одного знания о конкретной СУБД: всё, что у неё специфично,
+ * приезжает через [ConnectionFactory] — открытие, дополнительная проверка
+ * живости, очистка при уничтожении. Поэтому `PgConnectionPool` и `SQLitePool`
+ * тонкие, а эта механика пишется один раз.
  */
 class ConnectionPoolImpl(
     private val config: PoolConfig,
-    private val factory: suspend () -> Connection,
+    private val factory: ConnectionFactory,
 ) : ConnectionPool {
+
+    /**
+     * Пул поверх голой лямбды — для тех, кому не нужны хуки [ConnectionFactory]
+     * (тесты на фейковом драйвере, скрипты).
+     *
+     * Внутри это всё равно [ConnectionFactory]: отдельной ветки логики нет,
+     * чтобы «простой» конструктор не разъезжался с основным.
+     */
+    constructor(
+        config: PoolConfig,
+        factory: suspend () -> Connection,
+    ) : this(
+        config,
+        object : ConnectionFactory {
+            override suspend fun open(): Connection = factory()
+        },
+    )
 
     private val mutex = Mutex()
 
@@ -139,6 +163,15 @@ class ConnectionPoolImpl(
     private val idle = ArrayDeque<Entry>()
     private val inUse = mutableSetOf<PooledConnection>()
     private val waiters = ArrayDeque<Waiter>()
+
+    /**
+     * Уничтоженные соединения, ждущие [ConnectionFactory.onDiscard].
+     *
+     * Очередь, а не немедленный вызов, потому что `onDiscard` — `suspend`, а
+     * уничтожить соединение приходится и из синхронных путей, и из-под
+     * мьютекса. Разбирается на следующем [drainSuspend].
+     */
+    private val discards = ArrayDeque<Connection>()
 
     private var creating = 0
     private var closed = false
@@ -189,7 +222,34 @@ class ConnectionPoolImpl(
         }
     }
 
-    private suspend fun drainSuspend() = mutex.withLock { drainLocked() }
+    private suspend fun drainSuspend() {
+        val doomed = mutex.withLock {
+            drainLocked()
+            // Забираем список под мьютексом, а зовём onDiscard вне его: это
+            // код драйвера, он может ждать сеть, а держать под замком всю
+            // раздачу соединений из-за уборки нельзя.
+            if (discards.isEmpty()) {
+                emptyList()
+            } else {
+                val batch = discards.toList()
+                discards.clear()
+                batch
+            }
+        }
+        for (c in doomed) {
+            runCatching { factory.onDiscard(c) }
+        }
+    }
+
+    /**
+     * Закрыть соединение и поставить его на очистку.
+     *
+     * Только под мьютексом — [discards] разделяется с синхронным [drainNow].
+     */
+    private fun discardLocked(connection: Connection) {
+        runCatching { connection.close() }
+        discards.addLast(connection)
+    }
 
     private fun drainLocked() {
         while (true) {
@@ -286,7 +346,7 @@ class ConnectionPoolImpl(
         while (idle.isNotEmpty()) {
             val e = idle.removeLast()
             if ((now() - e.createdAt) > config.maxLifetime || (now() - e.lastUsedAt) > config.idleTimeout) {
-                runCatching { e.connection.close() }
+                discardLocked(e.connection)
                 continue
             }
             return wrapLocked(e)
@@ -301,7 +361,7 @@ class ConnectionPoolImpl(
     }
 
     private suspend fun createAndWrap(): PooledConnection {
-        val conn = factory()
+        val conn = factory.open()
         return mutex.withLock {
             creating--
             _totalCreated++
@@ -320,7 +380,7 @@ class ConnectionPoolImpl(
             runCatching { e.connection.isReadyForQuery }.getOrDefault(false)
 
         if (!reusable) {
-            runCatching { e.connection.close() }
+            discardLocked(e.connection)
             handoffLocked()
             return
         }
@@ -386,15 +446,21 @@ class ConnectionPoolImpl(
 
             for (e in idle) {
                 if ((now() - e.createdAt) > config.maxLifetime || (now() - e.lastUsedAt) > config.idleTimeout) {
-                    runCatching { e.connection.close() }
+                    discardLocked(e.connection)
                     closedCount++
                     continue
                 }
 
-                if (ping != null && (now() - e.lastPingAt) > config.pingInterval) {
-                    val alive = runCatching { e.connection.executeUpdate(ping) }.isSuccess
+                // Проверка живости: сначала запрос из конфигурации, затем слово
+                // драйвера. Основание то же, что у пинга — простой дольше
+                // `pingInterval`: иначе [ConnectionFactory.validate] превращался
+                // в лишний запрос на каждом вызове.
+                if ((now() - e.lastPingAt) > config.pingInterval) {
+                    val alive =
+                        (ping == null || runCatching { e.connection.executeUpdate(ping) }.isSuccess) &&
+                            runCatching { factory.validate(e.connection) }.getOrDefault(false)
                     if (!alive) {
-                        runCatching { e.connection.close() }
+                        discardLocked(e.connection)
                         closedCount++
                         continue
                     }
@@ -413,6 +479,15 @@ class ConnectionPoolImpl(
 
     // ------------------------------------------------------------------ close
 
+    /**
+     * Закрывает простаивающие соединения и запрещает брать новые.
+     *
+     * [ConnectionFactory.onDiscard] здесь не вызывается: close синхронный, а
+     * очистка — `suspend`, и заводить её в обход очереди означало бы гонку с
+     * тем, кто уже стоит на мьютексе. Драйверу, которому нужно что-то мыть на
+     * завершении, хватает собственного `close()` на соединении — он здесь
+     * вызывается.
+     */
     override fun close() {
         closed = true
         returns.close()

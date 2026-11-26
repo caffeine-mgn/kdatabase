@@ -28,8 +28,27 @@ kotlin {
     // зависимость от kdatabase не резолвится в appleMain. mingw — по той же
     // причине: kpostgres собран и под Windows.
     iosArm64()
+    iosX64()
     iosSimulatorArm64()
     mingwX64()
+
+    // Хвост Apple и Android Native объявлен потому, что ksqlite (драйвер)
+    // публикуется под них, и его зависимость на kdatabase обязана резолвиться
+    // во всех source set'ах. Контракты и механика пула от платформы не
+    // зависят, поэтому добавление таргетов ничего не стоит: кода под них нет,
+    // есть только пустой klib.
+    tvosX64()
+    tvosArm64()
+    tvosSimulatorArm64()
+    watchosX64()
+    watchosArm32()
+    watchosArm64()
+    watchosSimulatorArm64()
+    watchosDeviceArm64()
+    androidNativeArm32()
+    androidNativeArm64()
+    androidNativeX86()
+    androidNativeX64()
 
     // JS — ради IndexedDB в браузере. Контракты и пул от платформы не
     // зависят; драйвер IndexedDB появится отдельным модулем позже.

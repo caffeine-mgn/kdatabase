@@ -104,6 +104,24 @@ pool.withConnection { conn ->
 }
 ```
 
+## Релиз
+
+Публикация — GitHub Actions на `macos-latest`, триггер `git tag 0.1.0 && git
+push --tags`. Тег становится версией артефакта.
+
+**Этот репозиторий публикуется ПЕРВЫМ**: `korm` и адаптеры LMDB зависят от
+`pw.binom.db:kdatabase`, поэтому без него цепочка не соберётся.
+
+Секреты репозитория: `GPG_PRIVATE_KEY`, `GPG_PASSWORD`, `GPG_KEY_ID`,
+`CENTRAL_USERNAME`, `CENTRAL_PASSWORD`.
+
+Maven Central неизменяем — версию нельзя перезаписать. Перед тегом проверяйте
+локально:
+
+```bash
+./gradlew publishToMavenLocal -Pversion=X.Y.Z -PskipSigning=true
+```
+
 ## Тесты
 
 ```

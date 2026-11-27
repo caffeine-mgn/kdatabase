@@ -3,11 +3,25 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
-    `maven-publish`
+    alias(libs.plugins.dokka)
+    alias(libs.plugins.vanniktech.maven.publish)
 }
 
 group = "pw.binom.db"
-version = (findProperty("libVersion") as String?) ?: "0.1.0"
+/*
+ * Порядок версии: -Pversion (так передаёт CI и так ждёт vanniktech) → тег
+ * GitHub → libVersion из gradle.properties → 0.1.0.
+ *
+ * `-Pversion` обязан быть ПЕРВЫМ: Gradle уже использует это имя для
+ * Project.version, и если читать libVersion раньше, свойство из
+ * gradle.properties (0.1.0) перебьёт тег — релиз молча уедет версией 0.1.0.
+ */
+version = (findProperty("version") as String?)
+    ?.takeIf { it.isNotBlank() && it != "unspecified" }
+    ?: System.getenv("GITHUB_REF_NAME")?.removePrefix("v")
+    ?: (findProperty("libVersion") as String?)
+    ?.takeIf { it.isNotBlank() && it != "unspecified" }
+    ?: "0.1.0"
 
 kotlin {
     jvm {
@@ -69,11 +83,60 @@ kotlin {
     }
 }
 
-publishing {
-    repositories {
-        // Локальная публикация для соседних репозиториев (kpostgres, ksqlite,
-        // korm): они собираются против свежей версии без похода в Central.
-        mavenLocal()
+mavenPublishing {
+    /*
+     * Публикация в Maven Central через vanniktech.
+     *
+     * Версия берётся из тега CI (GITHUB_REF_NAME): тег `0.2.0` публикует 0.2.0,
+     * локально без тега остаётся 0.1.0.
+     */
+    publishToMavenCentral(automaticRelease = true)
+
+    /*
+     * Два режима подписи:
+     *  * CI: -PsigningUseGpg=true — ключ импортирован в keyring джобой, Gradle
+     *    зовёт бинарь gpg;
+     *  * локально: -PskipSigning=true — publishToMavenLocal без ключа.
+     */
+    if (findProperty("skipSigning") != "true") signAllPublications()
+
+    coordinates(group.toString(), "kdatabase", version.toString())
+
+    pom {
+        name.set("kdatabase")
+        description.set("Database contracts and connection pool for Kotlin Multiplatform")
+        url.set("https://github.com/caffeine-mgn/kdatabase")
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+        }
+        developers {
+            developer {
+                id.set("subochev")
+                name.set("Anton Subochev")
+                email.set("caffeine.mgn@gmail.com")
+            }
+        }
+        scm {
+            connection.set("https://github.com/caffeine-mgn/kdatabase.git")
+            url.set("https://github.com/caffeine-mgn/kdatabase")
+        }
+    }
+}
+
+/*
+ * Локальная публикация остаётся доступной для соседних репозиториев
+ * (kpostgres, ksqlite, korm): mavenLocal дешевле, чем поход в Central за
+ * свежей версией.
+ */
+pluginManager.withPlugin("signing") {
+    if (findProperty("signingUseGpg") == "true") {
+        extensions.configure<org.gradle.plugins.signing.SigningExtension>("signing") {
+            useGpgCmd()
+        }
+        logger.lifecycle("[signing] системный gpg (ключ из keyring)")
     }
 }
 

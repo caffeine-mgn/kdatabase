@@ -54,6 +54,39 @@ kpostgres-pool    kpostgres-orm
 `CompletableDeferred.getCompleted` требуют opt-in — заменены на `tryReceive`
 в цикле и явное поле результата. Предупреждений при сборке нет.
 
+## Подключение
+
+Артефакт публикуется в Maven Central, релиз — по тегу `N.N.N`.
+
+```kotlin
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Контракты БД и пул соединений.
+    implementation("pw.binom.db:kdatabase:0.1.0")
+}
+```
+
+Kotlin Multiplatform подтянет нужный klib сам — координата одна на все таргеты:
+
+| Таргет | Артефакт |
+|---|---|
+| JVM | `pw.binom.db:kdatabase-jvm` |
+| linuxX64 / linuxArm64 | `pw.binom.db:kdatabase-linuxx64` / `-linuxarm64` |
+| macosX64 / macosArm64 | `pw.binom.db:kdatabase-macosx64` / `-macosarm64` |
+| iOS / tvOS / watchOS | `pw.binom.db:kdatabase-iosarm64` и т.д. |
+| mingwX64 | `pw.binom.db:kdatabase-mingwx64` |
+| Android Native | `pw.binom.db:kdatabase-androidnativearm64` и т.д. |
+| JS (browser / nodejs) | `pw.binom.db:kdatabase-js` |
+
+Отдельных `-sources`/`-javadoc` объявлять не нужно: они приходят вместе с
+основным артефактом и нужны только IDE.
+
+**Драйвер в комплект не входит.** `kdatabase` — это контракт и пул; чтобы
+работать с конкретной СУБД, добавьте драйвер (`kpostgres`, `ksqlite`) или свой.
+
 ## Использование
 
 ```kotlin
